@@ -1,0 +1,350 @@
+#!/usr/bin/perl
+# -*- perl -*-
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename;
+use DateTime;
+
+=head1 NAME
+
+openvpn_ - Plugin to monitor the OpenVPN server on a system
+
+=head1 CONFIGURATION
+
+This script can generate various graphs for OpenVPN servers.
+
+First, ensure that your OpenVPN install is writing out statistics.
+To find the file used search for the status in your config
+
+  # grep 'status ' /etc/openvpn/server.conf
+  status openvpn-status.log
+
+If the line doesn't exist, add it in and restart the OpenVPN service.
+This usually makes the status file's full path as /etc/openvpn/openvpn-status.log
+
+
+
+Update your Munin plugins config to include the following. By default
+the script will try to read /etc/openvpn/openvpn-status.log if no 
+env.openvpn_status_file entry exists
+
+
+[openvpn_*]
+  user root
+  env.openvpn_status_file /var/log/openvpn.status
+
+Place/symlink openvpn_ into your Munin plugin area (Usually /usr/share/munin/plugins/)
+
+
+
+To list the graphs available run
+
+  $ ./openvpn_ suggest
+
+
+
+This is also provided as part of munin-node-configure
+
+  # munin-node-configure --suggest
+  openvpn_                   | no   | yes (+connected_users +total_traffic)
+
+
+  # munin-node-configure --suggest --shell
+  ln -s '/usr/share/munin/plugins/openvpn_' '/etc/munin/plugins/openvpn_connected_users'
+  ln -s '/usr/share/munin/plugins/openvpn_' '/etc/munin/plugins/openvpn_total_traffic'
+
+
+
+Setup the symlinks and restart munin-node service
+
+=head1 VERSION
+
+0.1
+
+=head1 SITE
+
+https://github.com/alasdairkeyes/munin-openvpn_
+
+=head1 AUTHOR
+
+Alasdair Keyes - https://akeyes.co.uk/
+
+=head1 LICENSE
+
+GPLv3
+
+=head1 MAGICK MARKERS
+
+ #%# family=auto
+ #%# capabilities=autoconf suggest
+
+=cut
+
+
+## Get the openvpn status file, try ENV, and some common locations
+    my $openvpn_status_file = $ENV{'openvpn_status_file'}
+        ? $ENV{'openvpn_status_file'}
+        : -f '/etc/openvpn/openvpn-status.log'
+        ? '/etc/openvpn/openvpn-status.log'
+        : error("No status file");
+
+
+## Month -> Numeric Month - Used for date -> epoch conversion
+    my $months = {
+        "Jan"   => 1,
+        "Feb"   => 2,
+        "Mar"   => 3,
+        "Apr"   => 4,
+        "May"   => 5,
+        "Jun"   => 6,
+        "Jul"   => 7,
+        "Aug"   => 8,
+        "Sep"   => 9,
+        "Oct"   => 10,
+        "Nov"   => 11,
+        "Dec"   => 12,
+    };
+
+
+## If the timestamp on the stats our over this manys seconds old, ignore the file
+## Stops any incorrect files left after crash/shutdown producing old results
+    my $deadtime_seconds = 120;
+
+
+# Get arguments from CLI
+    my $argument = shift(@ARGV) || '';
+
+
+
+## Define the graphs we support, the configs and processor function
+my $graphs = {
+
+    connected_users => {
+
+        config  => "graph_title Connected OpenVPN users
+graph_args -l 0
+graph_vlabel users
+graph_scale no
+graph_category openvpn
+graph_info Connected OpenVPN users
+openvpn_connected_users.label Connectd OpenVPN users
+openvpn_connected_users.info Connected OpenVPN users",
+
+        processor => \&connected_users,
+    },
+
+    total_traffic   => {
+
+        config  => "graph_title OpenVPN total traffic
+graph_vlabel bytes received and sent / \${graph_period}
+graph_scale no
+graph_category openvpn
+graph_info This graph shows the number of bytes sent/received by VPN users.
+graph_args --base 1000 -l 0
+sent.label bytes sent to clients
+sent.type DERIVE
+sent.min 0
+received.label bytes received from clients
+received.type DERIVE
+received.min 0",
+
+        processor   => \&total_traffic,
+    }
+
+};
+
+
+## Process autoconf argument
+    if ($argument eq "autoconf") {
+        if (-r $openvpn_status_file) {
+            print "yes\n";
+            exit 0;
+        } else {
+            print "no (cannot read '$openvpn_status_file')\n";
+            exit 0;
+        }
+
+## Process suggest argument
+    } elsif ($argument eq "suggest") {
+        foreach my $graph (keys(%$graphs)) {
+            print "$graph\n";
+        }
+        exit;
+
+## Process config argument
+    } elsif ($argument eq "config") {
+        my $wanted_graph = wanted_graph();
+        print $graphs->{ $wanted_graph }{ config } . "\n";
+        exit;
+
+## Process any other illegal argument
+    } elsif ($argument) {
+        error("Unknown argument");
+    }
+
+
+## Call this when something is wrong
+    sub error {
+        my @args = @_;
+        my $message = join(' ',@args);
+        die "Error: $message";
+    }
+
+
+## Parse the openvpn status file
+## Returns a hashref, key is the logged in user Common Name,
+## value is all related information
+#$data = {
+#          'last_update' => {
+#                             'epoch' => 'dddddddddd',
+#                             'human' => 'Day Mon DD HH:MM:SS YYYY'
+#                           },
+#          'users' => {
+#                       'commonname' => {
+#                                    'common_name' => 'commonname',
+#                                    'bytes_received' => '1',
+#                                    'bytes_sent' => '2',
+#                                    'real_address' => 'ip.add.re.ss:port',
+#                                    'virtual_address' => 'ip.add.re.ss',
+#                                    'last_ref' => 'Day Mon DD HH:MM:SS YYYY',
+#                                    'connected_since' => 'Day Mon DD HH:MM:SS YYYY'
+#                                  },
+#                     }
+#        };
+
+    sub parse_file {
+
+        my $contents = open(my $fh, '<', $openvpn_status_file)
+            || error("Failed to open '$openvpn_status_file': $!");
+
+        my $data = {};
+        my $section = '';
+        my @header = ();
+        foreach my $line (<$fh>) {
+            if ($line =~ /^Common Name,/) {
+                $section = 'clients';
+                @header = format_headers($line);
+                next;
+            } elsif ($line =~ /^Virtual Address,/) {
+                $section = 'routing';
+                @header = format_headers($line);
+                next;
+            } elsif ($line =~ /^(ROUTING|GLOBAL)/) {
+                $section = '';
+            }
+
+            if ($line =~ /^Updated,((\w{3})\s(\w{3})\s(\d{1,2})\s(\d{2}):(\d{2}):(\d{2})\s(\d{4}))$/ ) {
+                $data->{ last_update }{ human } = $1;
+                my $dt = DateTime->new(
+                    month   => $months->{ $3 },
+                    day     => $4,
+                    hour    => $5,
+                    minute  => $6,
+                    second  => $7,
+                    year    => $8,
+                ) || error("Failed to parse date");
+
+                $data->{ last_update }{ epoch } = $dt->epoch;
+            }
+
+            if ($section eq "clients") {
+                my @values = split(/,/, $line);
+                $_ =~ s/(^\s+|\s+$)//
+                    foreach (@values);
+
+                my %user;
+                @user{@header} = @values;
+                $data->{ users }{ $user{ common_name } } = \%user
+            } elsif ($section eq "routing") {
+                my @values = split(/,/, $line);
+                $_ =~ s/(^\s+|\s+$)//
+                    foreach (@values);
+
+                my %route;
+                @route{@header} = @values;
+                my $common_name = $route{ common_name };
+                foreach my $key (keys(%route)) {
+                    $data->{ users }{ $common_name }{ $key } = $route{ $key };
+                }
+                
+            }
+        }
+        my $now = DateTime->now();
+
+        # If the file hasn't been updated, don't read the values
+        $data = {}
+            if ($now->epoch - $data->{ last_update }{ epoch } > $deadtime_seconds);
+        return $data;
+         
+    }
+
+## Function to take the comma separated headers, and parse them into array
+## format 'header_text'
+    sub format_headers {
+        my $header_string = shift || '';
+        my @header = split(/,/, $header_string);
+        foreach my $h (@header) {
+            $h =~ s/(^\s+|\s+$)//g;
+            $h =~ s/\s/_/g;
+            $h = lc($h);
+        }
+        return @header;
+
+    }
+
+
+
+## Function to look at the name of the plugin being executed
+## Check it's one we know of and return it to caller
+## error() if anything is wrong
+## /etc/munin/plugins/openvpn_connected_users -> 'connected_users'
+    sub wanted_graph {
+        my $name = basename($0);
+
+        if ($name =~ /^openvpn_([a-z0-0_]+)$/) {
+            my $wanted_graph = $1;
+            error("Invalid graph '$wanted_graph'")
+                unless ($graphs->{ $wanted_graph });
+            return $wanted_graph;
+        }    
+
+        error ("Invalid plugin '$name'");    
+    }
+
+
+
+## Function to be called to handle the openvpn_connected_users plugin
+    sub connected_users {
+        my $data = parse_file();
+        print "openvpn_connected_users.value " . scalar(keys(%{$data->{ users }}));
+        print "\n";
+        exit;
+    }
+
+
+
+## Function to be called to handle the openvpn_total_traffic plugin
+    sub total_traffic {
+        my $data = parse_file();
+        my ($sent, $received) = (0,0);
+        foreach my $common_name (keys(%{$data->{ users }})) {
+            my $user_sent       = $data->{ users }{ $common_name }{ bytes_sent       } || 0;
+            my $user_received   = $data->{ users }{ $common_name }{ bytes_received   } || 0;
+            $sent       += $user_sent;
+            $received   += $user_received;
+        }
+        print "received.value $received\n";
+        print "sent.value $sent\n";
+    }
+
+
+
+
+## Find the graph wanted and process it
+    my $wanted_graph = wanted_graph();
+    my $function = $graphs->{ $wanted_graph }{ processor };
+    $function->();
+
+
